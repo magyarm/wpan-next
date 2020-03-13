@@ -250,6 +250,9 @@ static int bareudp_socket_create(struct bareudp_dev *bareudp, __be16 port)
 	tunnel_cfg.encap_destroy = NULL;
 	setup_udp_tunnel_sock(bareudp->net, sock, &tunnel_cfg);
 
+	/* As the setup_udp_tunnel_sock does not call udp_encap_enable if the
+	 * socket type is v6 an explicit call to udp_encap_enable is needed.
+	 */
 	if (sock->sk->sk_family == AF_INET6)
 		udp_encap_enable();
 
@@ -556,10 +559,17 @@ static int bareudp_validate(struct nlattr *tb[], struct nlattr *data[],
 	return 0;
 }
 
-static int bareudp2info(struct nlattr *data[], struct bareudp_conf *conf)
+static int bareudp2info(struct nlattr *data[], struct bareudp_conf *conf,
+			struct netlink_ext_ack *extack)
 {
-	if (!data[IFLA_BAREUDP_PORT] || !data[IFLA_BAREUDP_ETHERTYPE])
+	if (!data[IFLA_BAREUDP_PORT]) {
+		NL_SET_ERR_MSG(extack, "port not specified");
 		return -EINVAL;
+	}
+	if (!data[IFLA_BAREUDP_ETHERTYPE]) {
+		NL_SET_ERR_MSG(extack, "ethertype not specified");
+		return -EINVAL;
+	}
 
 	if (data[IFLA_BAREUDP_PORT])
 		conf->port =  nla_get_u16(data[IFLA_BAREUDP_PORT]);
@@ -635,7 +645,7 @@ static int bareudp_newlink(struct net *net, struct net_device *dev,
 	struct bareudp_conf conf;
 	int err;
 
-	err = bareudp2info(data, &conf);
+	err = bareudp2info(data, &conf, extack);
 	if (err)
 		return err;
 
@@ -801,6 +811,7 @@ static void __exit bareudp_cleanup_module(void)
 }
 module_exit(bareudp_cleanup_module);
 
+MODULE_ALIAS_RTNL_LINK("bareudp");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Martin Varghese <martin.varghese@nokia.com>");
 MODULE_DESCRIPTION("Interface driver for UDP encapsulated traffic");

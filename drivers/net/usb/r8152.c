@@ -891,7 +891,7 @@ struct fw_block {
 struct fw_header {
 	u8 checksum[32];
 	char version[RTL_VER_SIZE];
-	struct fw_block blocks[0];
+	struct fw_block blocks[];
 } __packed;
 
 /**
@@ -930,7 +930,7 @@ struct fw_mac {
 	__le32 reserved;
 	__le16 fw_ver_reg;
 	u8 fw_ver_data;
-	char info[0];
+	char info[];
 } __packed;
 
 /**
@@ -982,7 +982,7 @@ struct fw_phy_nc {
 	__le16 bp_start;
 	__le16 bp_num;
 	__le16 bp[4];
-	char info[0];
+	char info[];
 } __packed;
 
 enum rtl_fw_type {
@@ -3199,6 +3199,8 @@ static u16 r8153_phy_status(struct r8152 *tp, u16 desired)
 		}
 
 		msleep(20);
+		if (test_bit(RTL8152_UNPLUG, &tp->flags))
+			break;
 	}
 
 	return data;
@@ -5380,7 +5382,10 @@ static void r8153_init(struct r8152 *tp)
 		if (ocp_read_word(tp, MCU_TYPE_PLA, PLA_BOOT_CTRL) &
 		    AUTOLOAD_DONE)
 			break;
+
 		msleep(20);
+		if (test_bit(RTL8152_UNPLUG, &tp->flags))
+			break;
 	}
 
 	data = r8153_phy_status(tp, 0);
@@ -5517,7 +5522,10 @@ static void r8153b_init(struct r8152 *tp)
 		if (ocp_read_word(tp, MCU_TYPE_PLA, PLA_BOOT_CTRL) &
 		    AUTOLOAD_DONE)
 			break;
+
 		msleep(20);
+		if (test_bit(RTL8152_UNPLUG, &tp->flags))
+			break;
 	}
 
 	data = r8153_phy_status(tp, 0);
@@ -6345,6 +6353,7 @@ static int rtl8152_set_ringparam(struct net_device *netdev,
 }
 
 static const struct ethtool_ops ops = {
+	.supported_coalesce_params = ETHTOOL_COALESCE_USECS,
 	.get_drvinfo = rtl8152_get_drvinfo,
 	.get_link = ethtool_op_get_link,
 	.nway_reset = rtl8152_nway_reset,
