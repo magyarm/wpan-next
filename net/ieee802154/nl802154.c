@@ -1,5 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
+/* This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2
+ * as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
  * Authors:
  * Alexander Aring <aar@pengutronix.de>
@@ -30,6 +36,21 @@ enum nl802154_multicast_groups {
 
 static const struct genl_multicast_group nl802154_mcgrps[] = {
 	[NL802154_MCGRP_CONFIG] = { .name = "config", },
+};
+
+struct work802154 {
+	struct sk_buff *skb;
+	struct genl_info *info; // user_ptr[0] = rdev, user_ptr[1] = wpan_dev
+	int cmd; // selects which item in the union below to use
+	union {
+		// put any command specific structs in here
+		// Intended only for information that must be
+		// conveyed between a REQ and CNF. This should
+		// not be for the entire CNF or IND. Don't duplicate
+		// information from rdev, wpan_dev here
+	}cmd_data;
+	struct completion completion;
+	struct delayed_work work;
 };
 
 /* returns ERR_PTR values */
@@ -216,6 +237,14 @@ static const struct nla_policy nl802154_policy[NL802154_ATTR_MAX+1] = {
 
 	[NL802154_ATTR_PID] = { .type = NLA_U32 },
 	[NL802154_ATTR_NETNS_FD] = { .type = NLA_U32 },
+
+	[NL802154_ATTR_BEACON_SEQUENCE_NUMBER] = { .type = NLA_U8 },
+	[NL802154_ATTR_PAN_DESCRIPTOR] { .type = NLA_NESTED },
+	[NL802154_ATTR_PEND_ADDR_SPEC] = { .type = NLA_U8 },
+	[NL802154_ATTR_ADDR_LIST] = { .type = NLA_NESTED },
+	[NL802154_SDU_LENGTH] = { .type = NLA_U32 },
+	[NL802154_SDU] = { .type = NLA_NESTED },
+
 #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
 	[NL802154_ATTR_SEC_ENABLED] = { .type = NLA_U8, },
 	[NL802154_ATTR_SEC_OUT_LEVEL] = { .type = NLA_U32, },
@@ -236,14 +265,19 @@ nl802154_prepare_wpan_dev_dump(struct sk_buff *skb,
 			       struct cfg802154_registered_device **rdev,
 			       struct wpan_dev **wpan_dev)
 {
-	const struct genl_dumpit_info *info = genl_dumpit_info(cb);
 	int err;
 
 	rtnl_lock();
 
 	if (!cb->args[0]) {
+		err = nlmsg_parse(cb->nlh, GENL_HDRLEN + nl802154_fam.hdrsize,
+				  genl_family_attrbuf(&nl802154_fam),
+				  nl802154_fam.maxattr, nl802154_policy, NULL);
+		if (err)
+			goto out_unlock;
+
 		*wpan_dev = __cfg802154_wpan_dev_from_attrs(sock_net(skb->sk),
-							    info->attrs);
+							    genl_family_attrbuf(&nl802154_fam));
 		if (IS_ERR(*wpan_dev)) {
 			err = PTR_ERR(*wpan_dev);
 			goto out_unlock;
@@ -301,7 +335,7 @@ static inline void *nl802154hdr_put(struct sk_buff *skb, u32 portid, u32 seq,
 static int
 nl802154_put_flags(struct sk_buff *msg, int attr, u32 mask)
 {
-	struct nlattr *nl_flags = nla_nest_start_noflag(msg, attr);
+	struct nlattr *nl_flags = nla_nest_start(msg, attr);
 	int i;
 
 	if (!nl_flags)
@@ -327,7 +361,7 @@ nl802154_send_wpan_phy_channels(struct cfg802154_registered_device *rdev,
 	struct nlattr *nl_page;
 	unsigned long page;
 
-	nl_page = nla_nest_start_noflag(msg, NL802154_ATTR_CHANNELS_SUPPORTED);
+	nl_page = nla_nest_start(msg, NL802154_ATTR_CHANNELS_SUPPORTED);
 	if (!nl_page)
 		return -ENOBUFS;
 
@@ -349,11 +383,11 @@ nl802154_put_capabilities(struct sk_buff *msg,
 	struct nlattr *nl_caps, *nl_channels;
 	int i;
 
-	nl_caps = nla_nest_start_noflag(msg, NL802154_ATTR_WPAN_PHY_CAPS);
+	nl_caps = nla_nest_start(msg, NL802154_ATTR_WPAN_PHY_CAPS);
 	if (!nl_caps)
 		return -ENOBUFS;
 
-	nl_channels = nla_nest_start_noflag(msg, NL802154_CAP_ATTR_CHANNELS);
+	nl_channels = nla_nest_start(msg, NL802154_CAP_ATTR_CHANNELS);
 	if (!nl_channels)
 		return -ENOBUFS;
 
@@ -369,8 +403,8 @@ nl802154_put_capabilities(struct sk_buff *msg,
 	if (rdev->wpan_phy.flags & WPAN_PHY_FLAG_CCA_ED_LEVEL) {
 		struct nlattr *nl_ed_lvls;
 
-		nl_ed_lvls = nla_nest_start_noflag(msg,
-						   NL802154_CAP_ATTR_CCA_ED_LEVELS);
+		nl_ed_lvls = nla_nest_start(msg,
+					    NL802154_CAP_ATTR_CCA_ED_LEVELS);
 		if (!nl_ed_lvls)
 			return -ENOBUFS;
 
@@ -385,8 +419,7 @@ nl802154_put_capabilities(struct sk_buff *msg,
 	if (rdev->wpan_phy.flags & WPAN_PHY_FLAG_TXPOWER) {
 		struct nlattr *nl_tx_pwrs;
 
-		nl_tx_pwrs = nla_nest_start_noflag(msg,
-						   NL802154_CAP_ATTR_TX_POWERS);
+		nl_tx_pwrs = nla_nest_start(msg, NL802154_CAP_ATTR_TX_POWERS);
 		if (!nl_tx_pwrs)
 			return -ENOBUFS;
 
@@ -494,7 +527,7 @@ static int nl802154_send_wpan_phy(struct cfg802154_registered_device *rdev,
 	if (nl802154_put_capabilities(msg, rdev))
 		goto nla_put_failure;
 
-	nl_cmds = nla_nest_start_noflag(msg, NL802154_ATTR_SUPPORTED_COMMANDS);
+	nl_cmds = nla_nest_start(msg, NL802154_ATTR_SUPPORTED_COMMANDS);
 	if (!nl_cmds)
 		goto nla_put_failure;
 
@@ -550,8 +583,15 @@ static int nl802154_dump_wpan_phy_parse(struct sk_buff *skb,
 					struct netlink_callback *cb,
 					struct nl802154_dump_wpan_phy_state *state)
 {
-	const struct genl_dumpit_info *info = genl_dumpit_info(cb);
-	struct nlattr **tb = info->attrs;
+	struct nlattr **tb = genl_family_attrbuf(&nl802154_fam);
+	int ret = nlmsg_parse(cb->nlh, GENL_HDRLEN + nl802154_fam.hdrsize, tb,
+			      nl802154_fam.maxattr, nl802154_policy, NULL);
+
+	/* TODO check if we can handle error here,
+	 * we have no backward compatibility
+	 */
+	if (ret)
+		return 0;
 
 	if (tb[NL802154_ATTR_WPAN_PHY])
 		state->filter_wpan_phy = nla_get_u32(tb[NL802154_ATTR_WPAN_PHY]);
@@ -676,8 +716,7 @@ ieee802154_llsec_send_key_id(struct sk_buff *msg,
 
 	switch (desc->mode) {
 	case NL802154_KEY_ID_MODE_IMPLICIT:
-		nl_dev_addr = nla_nest_start_noflag(msg,
-						    NL802154_KEY_ID_ATTR_IMPLICIT);
+		nl_dev_addr = nla_nest_start(msg, NL802154_KEY_ID_ATTR_IMPLICIT);
 		if (!nl_dev_addr)
 			return -ENOBUFS;
 
@@ -752,7 +791,7 @@ static int nl802154_get_llsec_params(struct sk_buff *msg,
 			 params.frame_counter))
 		return -ENOBUFS;
 
-	nl_key_id = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_OUT_KEY_ID);
+	nl_key_id = nla_nest_start(msg, NL802154_ATTR_SEC_OUT_KEY_ID);
 	if (!nl_key_id)
 		return -ENOBUFS;
 
@@ -1290,7 +1329,8 @@ ieee802154_llsec_parse_dev_addr(struct nlattr *nla,
 {
 	struct nlattr *attrs[NL802154_DEV_ADDR_ATTR_MAX + 1];
 
-	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_DEV_ADDR_ATTR_MAX, nla, nl802154_dev_addr_policy, NULL))
+	if (!nla || nla_parse_nested(attrs, NL802154_DEV_ADDR_ATTR_MAX, nla,
+				     nl802154_dev_addr_policy, NULL))
 		return -EINVAL;
 
 	if (!attrs[NL802154_DEV_ADDR_ATTR_PAN_ID] ||
@@ -1329,7 +1369,8 @@ ieee802154_llsec_parse_key_id(struct nlattr *nla,
 {
 	struct nlattr *attrs[NL802154_KEY_ID_ATTR_MAX + 1];
 
-	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_KEY_ID_ATTR_MAX, nla, nl802154_key_id_policy, NULL))
+	if (!nla || nla_parse_nested(attrs, NL802154_KEY_ID_ATTR_MAX, nla,
+				     nl802154_key_id_policy, NULL))
 		return -EINVAL;
 
 	if (!attrs[NL802154_KEY_ID_ATTR_MODE])
@@ -1437,11 +1478,11 @@ static int nl802154_send_key(struct sk_buff *msg, u32 cmd, u32 portid,
 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
 		goto nla_put_failure;
 
-	nl_key = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_KEY);
+	nl_key = nla_nest_start(msg, NL802154_ATTR_SEC_KEY);
 	if (!nl_key)
 		goto nla_put_failure;
 
-	nl_key_id = nla_nest_start_noflag(msg, NL802154_KEY_ATTR_ID);
+	nl_key_id = nla_nest_start(msg, NL802154_KEY_ATTR_ID);
 	if (!nl_key_id)
 		goto nla_put_failure;
 
@@ -1544,7 +1585,9 @@ static int nl802154_add_llsec_key(struct sk_buff *skb, struct genl_info *info)
 	struct ieee802154_llsec_key_id id = { };
 	u32 commands[NL802154_CMD_FRAME_NR_IDS / 32] = { };
 
-	if (nla_parse_nested_deprecated(attrs, NL802154_KEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_KEY], nl802154_key_policy, info->extack))
+	if (nla_parse_nested(attrs, NL802154_KEY_ATTR_MAX,
+			     info->attrs[NL802154_ATTR_SEC_KEY],
+			     nl802154_key_policy, info->extack))
 		return -EINVAL;
 
 	if (!attrs[NL802154_KEY_ATTR_USAGE_FRAMES] ||
@@ -1592,7 +1635,9 @@ static int nl802154_del_llsec_key(struct sk_buff *skb, struct genl_info *info)
 	struct nlattr *attrs[NL802154_KEY_ATTR_MAX + 1];
 	struct ieee802154_llsec_key_id id;
 
-	if (nla_parse_nested_deprecated(attrs, NL802154_KEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_KEY], nl802154_key_policy, info->extack))
+	if (nla_parse_nested(attrs, NL802154_KEY_ATTR_MAX,
+			     info->attrs[NL802154_ATTR_SEC_KEY],
+			     nl802154_key_policy, info->extack))
 		return -EINVAL;
 
 	if (ieee802154_llsec_parse_key_id(attrs[NL802154_KEY_ATTR_ID], &id) < 0)
@@ -1617,7 +1662,7 @@ static int nl802154_send_device(struct sk_buff *msg, u32 cmd, u32 portid,
 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
 		goto nla_put_failure;
 
-	nl_device = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_DEVICE);
+	nl_device = nla_nest_start(msg, NL802154_ATTR_SEC_DEVICE);
 	if (!nl_device)
 		goto nla_put_failure;
 
@@ -1706,7 +1751,8 @@ ieee802154_llsec_parse_device(struct nlattr *nla,
 {
 	struct nlattr *attrs[NL802154_DEV_ATTR_MAX + 1];
 
-	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_DEV_ATTR_MAX, nla, nl802154_dev_policy, NULL))
+	if (!nla || nla_parse_nested(attrs, NL802154_DEV_ATTR_MAX,
+				     nla, nl802154_dev_policy, NULL))
 		return -EINVAL;
 
 	memset(dev, 0, sizeof(*dev));
@@ -1757,7 +1803,9 @@ static int nl802154_del_llsec_dev(struct sk_buff *skb, struct genl_info *info)
 	struct nlattr *attrs[NL802154_DEV_ATTR_MAX + 1];
 	__le64 extended_addr;
 
-	if (nla_parse_nested_deprecated(attrs, NL802154_DEV_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_DEVICE], nl802154_dev_policy, info->extack))
+	if (nla_parse_nested(attrs, NL802154_DEV_ATTR_MAX,
+			     info->attrs[NL802154_ATTR_SEC_DEVICE],
+			     nl802154_dev_policy, info->extack))
 		return -EINVAL;
 
 	if (!attrs[NL802154_DEV_ATTR_EXTENDED_ADDR])
@@ -1783,7 +1831,7 @@ static int nl802154_send_devkey(struct sk_buff *msg, u32 cmd, u32 portid,
 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
 		goto nla_put_failure;
 
-	nl_devkey = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_DEVKEY);
+	nl_devkey = nla_nest_start(msg, NL802154_ATTR_SEC_DEVKEY);
 	if (!nl_devkey)
 		goto nla_put_failure;
 
@@ -1793,7 +1841,7 @@ static int nl802154_send_devkey(struct sk_buff *msg, u32 cmd, u32 portid,
 			devkey->frame_counter))
 		goto nla_put_failure;
 
-	nl_key_id = nla_nest_start_noflag(msg, NL802154_DEVKEY_ATTR_ID);
+	nl_key_id = nla_nest_start(msg, NL802154_DEVKEY_ATTR_ID);
 	if (!nl_key_id)
 		goto nla_put_failure;
 
@@ -1883,7 +1931,9 @@ static int nl802154_add_llsec_devkey(struct sk_buff *skb, struct genl_info *info
 	__le64 extended_addr;
 
 	if (!info->attrs[NL802154_ATTR_SEC_DEVKEY] ||
-	    nla_parse_nested_deprecated(attrs, NL802154_DEVKEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_DEVKEY], nl802154_devkey_policy, info->extack) < 0)
+	    nla_parse_nested(attrs, NL802154_DEVKEY_ATTR_MAX,
+			     info->attrs[NL802154_ATTR_SEC_DEVKEY],
+			     nl802154_devkey_policy, info->extack) < 0)
 		return -EINVAL;
 
 	if (!attrs[NL802154_DEVKEY_ATTR_FRAME_COUNTER] ||
@@ -1913,7 +1963,9 @@ static int nl802154_del_llsec_devkey(struct sk_buff *skb, struct genl_info *info
 	struct ieee802154_llsec_device_key key;
 	__le64 extended_addr;
 
-	if (nla_parse_nested_deprecated(attrs, NL802154_DEVKEY_ATTR_MAX, info->attrs[NL802154_ATTR_SEC_DEVKEY], nl802154_devkey_policy, info->extack))
+	if (nla_parse_nested(attrs, NL802154_DEVKEY_ATTR_MAX,
+			     info->attrs[NL802154_ATTR_SEC_DEVKEY],
+			     nl802154_devkey_policy, info->extack))
 		return -EINVAL;
 
 	if (!attrs[NL802154_DEVKEY_ATTR_EXTENDED_ADDR])
@@ -1947,7 +1999,7 @@ static int nl802154_send_seclevel(struct sk_buff *msg, u32 cmd, u32 portid,
 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
 		goto nla_put_failure;
 
-	nl_seclevel = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_LEVEL);
+	nl_seclevel = nla_nest_start(msg, NL802154_ATTR_SEC_LEVEL);
 	if (!nl_seclevel)
 		goto nla_put_failure;
 
@@ -2033,7 +2085,8 @@ llsec_parse_seclevel(struct nlattr *nla, struct ieee802154_llsec_seclevel *sl)
 {
 	struct nlattr *attrs[NL802154_SECLEVEL_ATTR_MAX + 1];
 
-	if (!nla || nla_parse_nested_deprecated(attrs, NL802154_SECLEVEL_ATTR_MAX, nla, nl802154_seclevel_policy, NULL))
+	if (!nla || nla_parse_nested(attrs, NL802154_SECLEVEL_ATTR_MAX,
+				     nla, nl802154_seclevel_policy, NULL))
 		return -EINVAL;
 
 	memset(sl, 0, sizeof(*sl));
@@ -2093,6 +2146,277 @@ static int nl802154_del_llsec_seclevel(struct sk_buff *skb,
 	return rdev_del_seclevel(rdev, wpan_dev, &sl);
 }
 #endif /* CONFIG_IEEE802154_NL802154_EXPERIMENTAL */
+
+static int ieee802154_send_beacon_command_frame(struct net_device *netdev, u8 cmd_frame_id)
+{
+	int r = 0;
+	struct sk_buff *skb;
+	struct ieee802154_mac_cb *cb;
+	int hlen, tlen, size;
+	struct ieee802154_addr dst_addr, src_addr;
+	unsigned char *data;
+
+	//Create beacon frame / payload
+	hlen = 7; //Header is 7 octets from IEEE 802.15.4 std 2011
+	tlen = netdev->needed_tailroom;
+	size = 1; //Todo; Replace magic number with a define. Comes from ieee std 802154 "Beacon Request Frame Format"
+
+	skb = alloc_skb(hlen + tlen + size, GFP_KERNEL);
+	if(!skb) {
+		goto error;
+	}
+
+	skb_reserve(skb, hlen);
+
+	skb_reset_network_header(skb);
+
+	data = skb_put(skb, size);
+
+	src_addr.mode = IEEE802154_ADDR_NONE;
+	dst_addr.mode = IEEE802154_ADDR_SHORT;
+	dst_addr.pan_id = IEEE802154_PANID_BROADCAST;
+	dst_addr.short_addr = IEEE802154_ADDR_BROADCAST;
+
+	cb = mac_cb_init(skb);
+	cb->type = IEEE802154_FC_TYPE_MAC_CMD;
+	cb->ackreq = false;
+
+	cb->secen = false;
+	cb->secen_override = false;
+	cb->seclevel = 0;
+
+	cb->source = src_addr;
+	cb->dest = dst_addr;
+
+	r = netdev->header_ops->create(skb, netdev, ETH_P_IEEE802154, &dst_addr, &src_addr, hlen + tlen + size);
+
+	//Add the mac header to the data
+	memcpy(data, cb, size);
+	data[0] = cmd_frame_id;
+
+	skb->dev = netdev;
+	skb->protocol = htons(ETH_P_IEEE802154);
+
+	r = netdev->netdev_ops->ndo_start_xmit(skb,netdev);
+	if(0==r) {
+		goto out;
+	}
+
+error:
+	kfree_skb(skb);
+out:
+	return r;
+
+}
+
+//Todo: Look at replacing genl_info *info with a call back like the (de)register_beacon function
+static int nl802154_beacon_ind(struct genl_info *info, struct ieee802154_beacon_indication *ind)
+{
+	int ret = 0;
+
+	int i;
+	void *hdr;
+	struct sk_buff *msg;
+	struct nlattr *nl_pan_desc;
+	struct nlattr *nl_sdu;
+	struct cfg802154_registered_device *rdev = info->user_ptr[0];
+
+	dev_dbg(&rdev->wpan_phy.dev, "Inside %s\n", __FUNCTION__);
+
+	msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+	if(NULL == msg) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	hdr = nl802154hdr_put(msg, info->snd_portid, info->snd_seq, 0, NL802154_CMD_BEACON_NOTIFY_IND);
+	if(NULL == hdr) {
+		ret = -ENOBUFS;
+		goto free_reply;
+	}
+
+	ret = nla_put_u8(msg, NL802154_ATTR_BEACON_SEQUENCE_NUMBER, ind->bsn);
+	if(0 != ret) {
+		goto nla_put_failure;
+	}
+
+	nl_pan_desc = nla_nest_start(msg, NL802154_ATTR_PAN_DESCRIPTOR);
+	if (nla_put_u8(msg, NL802154_ATTR_PAN_DESC_SRC_ADDR_MODE, ind->pan_desc.src_addr_mode) ||
+		nla_put_u16(msg, NL802154_ATTR_PAN_DESC_SRC_PAN_ID, ind->pan_desc.src_pan_id) ||
+		nla_put_u64_64bit(msg, NL802154_ATTR_PAN_DESC_SRC_ADDR, ind->pan_desc.src_addr, NL802154_ATTR_PAD) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_CHANNEL_NUM, ind->pan_desc.channel_num) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_CHANNEL_PAGE, ind->pan_desc.channel_page) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_SUPERFRAME_SPEC, ind->pan_desc.superframe_spec) ||
+		nla_put_u32(msg, NL802154_ATTR_PAN_DESC_GTS_PERMIT, ind->pan_desc.gts_permit) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_LQI, ind->pan_desc.lqi) ||
+		nla_put_u32(msg, NL802154_ATTR_PAN_DESC_TIME_STAMP, ind->pan_desc.time_stamp) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_SEC_STATUS, ind->pan_desc.sec_status) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_SEC_LEVEL, ind->pan_desc.sec_level) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_KEY_ID_MODE, ind->pan_desc.key_id_mode) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_KEY_SRC, ind->pan_desc.key_src) ||
+		nla_put_u8 (msg, NL802154_ATTR_PAN_DESC_KEY_INDEX, ind->pan_desc.key_index) ) {
+			ret = -ENOBUFS;
+			goto free_reply;
+	}
+	nla_nest_end(msg, nl_pan_desc);
+
+	ret = nla_put_u8(msg, NL802154_ATTR_PEND_ADDR_SPEC, ind->pend_addr_spec);
+	if(0 != ret) {
+		goto nla_put_failure;
+	}
+
+	ret = nla_put_u32(msg, NL802154_SDU_LENGTH, ind->sdu_len);
+	if(0 != ret) {
+		goto nla_put_failure;
+	}
+
+	nl_sdu = nla_nest_start( msg, NL802154_SDU );
+	for (i = 0; i <= ind->sdu_len; i++) {
+		ret = nla_put_u8(msg, NL802154_ATTR_SDU_ENTRY, ind->sdu[i]);
+		if ( 0 != ret ) {
+			goto nla_put_failure;
+		}
+	}
+	nla_nest_end( msg, nl_sdu );
+
+	genlmsg_end( msg, hdr );
+
+	ret = genlmsg_reply( msg, info );
+	goto out;
+
+nla_put_failure:
+free_reply:
+	nlmsg_free( msg );
+
+out:
+	return ret;
+}
+
+static void nl802154_beacon_ind_complete(struct sk_buff *skb_in, const struct ieee802154_hdr *hdr, void *arg)
+{
+	struct work_struct *work = (struct work_struct *)arg;
+	struct work802154 *wrk = container_of( to_delayed_work(work), struct work802154, work);
+
+	struct genl_info *info = wrk->info;
+
+	struct cfg802154_registered_device *rdev = info->user_ptr[0];
+	struct wpan_dev *wpan_dev = info->user_ptr[1];
+
+	/* Grab beacon indication data */
+	struct ieee802154_beacon_indication ind;
+	memset(&ind, 0, sizeof(ind));
+
+	ind.bsn = hdr->seq;
+	ind.pan_desc.src_addr			= mac_cb(skb_in)->source.short_addr;
+	ind.pan_desc.src_pan_id			= mac_cb(skb_in)->source.pan_id;
+	ind.pan_desc.channel_num		= rdev->wpan_phy.current_channel;
+	ind.pan_desc.channel_num     = rdev->wpan_phy.current_channel;
+	ind.pan_desc.superframe_spec = 0;
+	ind.pan_desc.gts_permit      = 0;
+	ind.pan_desc.lqi             = mac_cb(skb_in)->lqi;
+	ind.pan_desc.time_stamp      = 0;
+	ind.pan_desc.sec_status      = 0;
+	ind.pan_desc.sec_level       = mac_cb(skb_in)->seclevel;
+	ind.pan_desc.key_id_mode     = hdr->sec.key_id_mode;
+	ind.pan_desc.key_src         = 0;
+	ind.pan_desc.key_index       = hdr->sec.key_id;
+	ind.sdu_len = skb_in->len - skb_in->data_len;
+	memcpy(&ind.sdu, skb_in->data, ind.sdu_len);
+
+	cancel_delayed_work( &wrk->work );
+
+	rdev_deregister_beacon_listener( rdev, wpan_dev, nl802154_beacon_ind_complete, work );
+
+	nl802154_beacon_ind( info, &ind );
+
+	complete( &wrk->completion );
+
+	kfree( wrk );
+}
+
+static void nl802154_beacon_ind_timeout(struct work_struct *work)
+{
+	struct ieee802154_beacon_indication ind = { 0 };
+
+	struct work802154 *wrk = container_of(to_delayed_work(work), struct work802154, work);
+
+	struct genl_info *info = wrk->info;
+	struct cfg802154_registered_device *rdev = info->user_ptr[0];
+	nl802154_beacon_ind(info, &ind);
+
+	rdev_deregister_beacon_listener(rdev, NULL, nl802154_beacon_ind_complete, work);
+
+	complete(&wrk->completion);
+	kfree(wrk);
+}
+
+static int nl802154_send_beacon_request(struct sk_buff *skb, struct genl_info *info)
+{
+	int r = 0;
+
+	struct net_device *netdev;
+
+	netdev = info->user_ptr[0];
+
+	r =ieee802154_send_beacon_command_frame(netdev, IEEE802154_CMD_BEACON_REQ);
+
+	return r;
+}
+
+static int nl802154_get_beacon_indication(struct sk_buff *skb, struct genl_info *info)
+{
+	int r = 0;
+
+	u16 timeout_ms;
+	struct cfg802154_registered_device *rdev;
+	struct work802154 *wrk;
+	struct wpan_dev *wpan_dev;
+	struct net_device *dev;
+
+	rdev = info->user_ptr[0];
+	wpan_dev = (struct wpan_dev *) &rdev->wpan_phy.dev;
+	dev = (struct net_device *) &wpan_dev->netdev;
+
+	dev_dbg( &dev->dev, "Inside %s\n", __FUNCTION__);
+
+	if(!(info->attrs[ NL802154_ATTR_BEACON_INDICATION_TIMEOUT ] )) {
+		r = -EINVAL;
+		goto out;
+	}
+
+	timeout_ms = nla_get_u16( info->attrs[ NL802154_ATTR_BEACON_INDICATION_TIMEOUT ] );
+
+	wrk->info = info;
+
+	//Enable reception of beacon packets, and sendout out netlink response
+	r = rdev_register_beacon_listener(rdev, wpan_dev, nl802154_beacon_ind_complete, &wrk->work.work);
+	if( 0 != r) {
+		dev_err( &dev->dev, "rdev_register_beacon_ind_listener failed (%d)\n",r);
+		goto free_wrk;
+	}
+
+	init_completion( &wrk->completion );
+	INIT_DELAYED_WORK( &wrk->work, nl802154_beacon_ind_timeout);
+	r = schedule_delayed_work( &wrk->work, msecs_to_jiffies(timeout_ms)) ? 0 : -EALREADY;
+	if ( 0 != r ) {
+		dev_err(&dev->dev, "nl802154_add_work failed (%d)\n", r );
+		goto free_wrk;
+	}
+
+	// Wait for work function to signal completion after timeout_ms. This should be enough
+	// time for us to receive a beacon frame and send the indication back to user space
+	// before returning ( and closing the netlink socket ).
+	// Data is queued up and sent out once this doit() function returns.
+
+	wait_for_completion(&wrk->completion);
+
+	goto out;
+	
+free_wrk:
+	kfree(wrk);
+out:
+	return r;
+}
 
 #define NL802154_FLAG_NEED_WPAN_PHY	0x01
 #define NL802154_FLAG_NEED_NETDEV	0x02
@@ -2187,167 +2511,180 @@ static void nl802154_post_doit(const struct genl_ops *ops, struct sk_buff *skb,
 static const struct genl_ops nl802154_ops[] = {
 	{
 		.cmd = NL802154_CMD_GET_WPAN_PHY,
-		.validate = GENL_DONT_VALIDATE_STRICT |
-			    GENL_DONT_VALIDATE_DUMP_STRICT,
 		.doit = nl802154_get_wpan_phy,
 		.dumpit = nl802154_dump_wpan_phy,
 		.done = nl802154_dump_wpan_phy_done,
+		.policy = nl802154_policy,
 		/* can be retrieved by unprivileged users */
 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_GET_INTERFACE,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_get_interface,
 		.dumpit = nl802154_dump_interface,
+		.policy = nl802154_policy,
 		/* can be retrieved by unprivileged users */
 		.internal_flags = NL802154_FLAG_NEED_WPAN_DEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_NEW_INTERFACE,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_new_interface,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_DEL_INTERFACE,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_del_interface,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_WPAN_DEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_CHANNEL,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_channel,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_CCA_MODE,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_cca_mode,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_CCA_ED_LEVEL,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_cca_ed_level,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_TX_POWER,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_tx_power,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_WPAN_PHY_NETNS,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_wpan_phy_netns,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_PAN_ID,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_pan_id,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_SHORT_ADDR,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_short_addr,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_BACKOFF_EXPONENT,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_backoff_exponent,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_MAX_CSMA_BACKOFFS,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_max_csma_backoffs,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_MAX_FRAME_RETRIES,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_max_frame_retries,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_LBT_MODE,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_lbt_mode,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_SET_ACKREQ_DEFAULT,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_ackreq_default,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
+	{
+		.cmd = NL802154_CMD_SET_BEACON_REQUEST,
+		.doit = nl802154_send_beacon_request,
+		.policy = nl802154_policy,
+		.flags = GENL_ADMIN_PERM,
+		.internal_flags = NL802154_FLAG_NEED_NETDEV,
+	},
+	{
+		.cmd = NL802154_CMD_GET_BEACON_NOTIFY,
+		.doit = nl802154_get_beacon_indication,
+		.policy = nl802154_policy,
+		.flags = GENL_ADMIN_PERM,
+		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+				NL802154_FLAG_NEED_RTNL,
+	},
 #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
 	{
 		.cmd = NL802154_CMD_SET_SEC_PARAMS,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_set_llsec_params,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_GET_SEC_KEY,
-		.validate = GENL_DONT_VALIDATE_STRICT |
-			    GENL_DONT_VALIDATE_DUMP_STRICT,
 		/* TODO .doit by matching key id? */
 		.dumpit = nl802154_dump_llsec_key,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_NEW_SEC_KEY,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_add_llsec_key,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_DEL_SEC_KEY,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_del_llsec_key,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
@@ -2355,26 +2692,25 @@ static const struct genl_ops nl802154_ops[] = {
 	/* TODO unique identifier must short+pan OR extended_addr */
 	{
 		.cmd = NL802154_CMD_GET_SEC_DEV,
-		.validate = GENL_DONT_VALIDATE_STRICT |
-			    GENL_DONT_VALIDATE_DUMP_STRICT,
 		/* TODO .doit by matching extended_addr? */
 		.dumpit = nl802154_dump_llsec_dev,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_NEW_SEC_DEV,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_add_llsec_dev,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_DEL_SEC_DEV,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_del_llsec_dev,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
@@ -2382,53 +2718,51 @@ static const struct genl_ops nl802154_ops[] = {
 	/* TODO remove complete devkey, put it as nested? */
 	{
 		.cmd = NL802154_CMD_GET_SEC_DEVKEY,
-		.validate = GENL_DONT_VALIDATE_STRICT |
-			    GENL_DONT_VALIDATE_DUMP_STRICT,
 		/* TODO doit by matching ??? */
 		.dumpit = nl802154_dump_llsec_devkey,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_NEW_SEC_DEVKEY,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_add_llsec_devkey,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_DEL_SEC_DEVKEY,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_del_llsec_devkey,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_GET_SEC_LEVEL,
-		.validate = GENL_DONT_VALIDATE_STRICT |
-			    GENL_DONT_VALIDATE_DUMP_STRICT,
 		/* TODO .doit by matching frame_type? */
 		.dumpit = nl802154_dump_llsec_seclevel,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_NEW_SEC_LEVEL,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.doit = nl802154_add_llsec_seclevel,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
 	},
 	{
 		.cmd = NL802154_CMD_DEL_SEC_LEVEL,
-		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		/* TODO match frame_type only? */
 		.doit = nl802154_del_llsec_seclevel,
+		.policy = nl802154_policy,
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
 				  NL802154_FLAG_NEED_RTNL,
@@ -2441,7 +2775,6 @@ static struct genl_family nl802154_fam __ro_after_init = {
 	.hdrsize = 0,			/* no private header */
 	.version = 1,			/* no particular meaning now */
 	.maxattr = NL802154_ATTR_MAX,
-	.policy = nl802154_policy,
 	.netnsok = true,
 	.pre_doit = nl802154_pre_doit,
 	.post_doit = nl802154_post_doit,

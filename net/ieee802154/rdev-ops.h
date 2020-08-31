@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __CFG802154_RDEV_OPS
 #define __CFG802154_RDEV_OPS
 
@@ -207,6 +206,24 @@ rdev_set_ackreq_default(struct cfg802154_registered_device *rdev,
 	ret = rdev->ops->set_ackreq_default(&rdev->wpan_phy, wpan_dev, ackreq);
 	trace_802154_rdev_return_int(&rdev->wpan_phy, ret);
 	return ret;
+}
+
+static inline int
+rdev_register_beacon_listener(struct cfg802154_registered_device *rdev,
+			struct wpan_dev *wpan_dev,
+			void (*callback)(struct sk_buff *, const struct ieee802154_hdr *, void *), void *arg)
+{
+	int ret = 0;
+	ret = rdev->ops->register_beacon_listener(&rdev->wpan_phy, wpan_dev, callback, arg);
+	return ret;
+}
+
+static inline void
+rdev_deregister_beacon_listener(struct cfg802154_registered_device *rdev,
+			struct wpan_dev *wpan_dev,
+			void (*callback)(struct sk_buff *, const struct ieee802154_hdr *, void *), void *arg)
+{
+	rdev->ops->deregister_beacon_listener( &rdev->wpan_phy, wpan_dev, callback, arg);
 }
 
 #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL

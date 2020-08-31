@@ -1,6 +1,14 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (C) 2007, 2008, 2009 Siemens AG
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2
+ * as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
  * Written by:
  * Dmitry Eremin-Solenikov <dbaryshkov@gmail.com>
@@ -18,6 +26,7 @@
 
 struct wpan_phy;
 struct wpan_phy_cca;
+struct ieee802154_hdr;
 
 #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
 struct ieee802154_llsec_device_key;
@@ -67,6 +76,14 @@ struct cfg802154_ops {
 				struct wpan_dev *wpan_dev, bool mode);
 	int	(*set_ackreq_default)(struct wpan_phy *wpan_phy,
 				      struct wpan_dev *wpan_dev, bool ackreq);
+	int (*register_beacon_listener)(struct wpan_phy *wpan_phy,
+				struct wpan_dev *wpan_dev,
+				void (*callback)(struct sk_buff *, const struct ieee802154_hdr *, void *), void *arg);
+	void (*deregister_beacon_listener)(struct wpan_phy *wpan_phy,
+				struct wpan_dev *wpan_dev,
+				void (*callback)(struct sk_buff *, const struct ieee802154_hdr *, void *), void *arg);
+	int (*send_beacon_request_command_frame)(struct wpan_phy *wpan_phy,
+				struct wpan_dev *wpan_dev, u8 cmd_frame_if);
 #ifdef CONFIG_IEEE802154_NL802154_EXPERIMENTAL
 	void	(*get_llsec_table)(struct wpan_phy *wpan_phy,
 				   struct wpan_dev *wpan_dev,
@@ -214,7 +231,7 @@ struct wpan_phy {
 	/* the network namespace this phy lives in currently */
 	possible_net_t _net;
 
-	char priv[] __aligned(NETDEV_ALIGN);
+	char priv[0] __aligned(NETDEV_ALIGN);
 };
 
 static inline struct net *wpan_phy_net(struct wpan_phy *wpan_phy)
@@ -339,9 +356,13 @@ struct wpan_dev {
 	u32 identifier;
 
 	/* MAC PIB */
+	u8 addr_mode;
 	__le16 pan_id;
-	__le16 short_addr;
+	__le16 short_addr;;
 	__le64 extended_addr;
+	u8 coord_addr_mode;
+	__le16 coord_short_addr;
+	__le64 coord_extended_addr;
 
 	/* MAC BSN field */
 	atomic_t bsn;
@@ -404,5 +425,7 @@ static inline const char *wpan_phy_name(struct wpan_phy *phy)
 {
 	return dev_name(&phy->dev);
 }
+
+int nl802154_beacon_notify_indication( struct ieee802154_beacon_indication *beacon_notify, struct genl_info *info );
 
 #endif /* __NET_CFG802154_H */
