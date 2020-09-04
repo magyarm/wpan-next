@@ -316,6 +316,24 @@ rdev_del_devkey(struct cfg802154_registered_device *rdev,
 	return rdev->ops->del_devkey(&rdev->wpan_phy, wpan_dev, extended_addr,
 				     devkey);
 }
+
+static inline int
+rdev_register_beacon_listener(struct cfg802154_registered_device *rdev,
+		struct wpan_dev *wpan_dev,
+		void (*callback)(struct sk_buff *, const struct ieee802154_hdr *, void *), void *arg)
+{
+	int ret = 0;
+	ret = rdev->ops->register_beacon_listener(&rdev->wpan_phy, wpan_dev, callback, arg);
+	return ret;
+}
+
+static inline void
+rdev_deregister_beacon_listener(struct cfg802154_registered_device *rdev,
+		struct wpan_dev *wpan_dev,
+		void (*callback)(struct sk_buff *, const struct ieee802154_hdr *, void *), void *arg)
+{
+	rdev->ops->deregister_beacon_listener( &rdev->wpan_phy, wpan_dev, callback, arg);
+}
 #endif /* CONFIG_IEEE802154_NL802154_EXPERIMENTAL */
 
 #endif /* __CFG802154_RDEV_OPS */
